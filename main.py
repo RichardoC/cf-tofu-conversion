@@ -5,21 +5,36 @@ import subprocess
 import os
 import sys
 import time
-import ollama
 from shutil import copytree
-from ollama import Client
+from openai import OpenAI
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Automate tofu planning and fixing using Ollama model.")
+    parser = argparse.ArgumentParser(description="Automate tofu planning and fixing using OpenAI GPT-4.")
     parser.add_argument('--tf-bin', required=True, help='Path to the tofu binary.')
     parser.add_argument('--input', required=True, help='Input folder for tofu.')
     parser.add_argument('--output-folder', required=True, help='Output folder for fixed files.')
     parser.add_argument('--original-template', required=True, help='Path to the original CloudFormation template.')
-    parser.add_argument('--ollama-host', default='http://localhost:11434', help='Ollama host URL (e.g., http://localhost:11434).')
-    parser.add_argument('--ollama-model', default='llama3.1:8b', help='Ollama model name. Default is "llama3.1:8b".')
+    parser.add_argument('--openai-api-key', default=None, help='OpenAI API key. Alternatively, set the OPENAI_API_KEY environment variable.')
+    parser.add_argument('--openai-model', default='gpt-4o-mini-2024-07-18', help='OpenAI model name. Default is "gpt-4".')
     parser.add_argument('--max-retries', type=int, default=5, help='Maximum number of retries for fixing.')
     parser.add_argument('--sleep-interval', type=int, default=10, help='Seconds to wait between retries.')
     return parser.parse_args()
+
+def initialize_openai(api_key):
+    """
+    Initializes the OpenAI API client with the provided API key.
+    """
+    if api_key:
+        key = api_key
+    else:
+        key = os.getenv('OPENAI_API_KEY')
+        if not key:
+            print("Error: OpenAI API key not provided. Use the '--openai-api-key' argument or set the OPENAI_API_KEY environment variable.")
+            sys.exit(1)
+    client = OpenAI(
+        api_key=key
+    )
+    return client
 
 def run_tofu(tf_bin, working_folder):
     """
@@ -100,68 +115,43 @@ def read_original_template(template_path):
         print(f"Error reading original CloudFormation template: {e}")
         sys.exit(1)
 
-def send_to_ollama(host, model, tofu_output, files_content, original_template):
+def send_to_openai(client, model, messages):
     """
-    Sends the tofu output, files content, and original template to the Ollama model.
-    Streams the response in real-time.
+    Sends messages to the OpenAI API and streams the response in real-time.
     Returns the fixed files content as a dictionary.
     """
-    # Initialize the Ollama client
-    client = Client(host=host)
-
-    # Construct the prompt
-    prompt = f"""The following is the output from the tofu tool:
-
-{tofu_output}
-
-Here are the contents of the files:
-
-"""
-
-    # Include all files from the output folder
-    for filename, content in files_content.items():
-        prompt += f"[START FILE: {filename}]\n{content}\n[END FILE]\n\n"
-
-    # Include the original CloudFormation template
-    original_filename, original_content = original_template
-    prompt += f"[START FILE: {original_filename}]\n{original_content}\n[END FILE]\n\n"
-
-    prompt += """Please fix the files based on the tofu output. Ensure that the Terraform configuration aligns with the provided CloudFormation template. Provide only the fixed file contents with no additional commentary, maintaining the same filenames and the same [START FILE] and [END FILE] markers for each file."""
-
-    # Prepare the messages for the Ollama chat
-    messages = [
-        {
-            'role': 'system',
-            'content': 'I am an expert at fixing Terraform files after a migration from cloudformation. Please provide the output from the terraform tool and the contents of the files that need to be fixed and their original cloudformation. I am extremely experienced with AWS.'
-        },
-        {
-            'role': 'user',
-            'content': prompt
-        }
-    ]
-
     try:
-        print("\n--- Sending to Ollama Model ---\n")
-        # Stream the response
+        print("\n--- Sending to OpenAI GPT-4 Model ---\n")
         fixed_files_text = ""
-        response_stream = client.chat(model=model, messages=messages, stream=True)
-
-        print("\n--- Ollama Model Response ---\n")
-        for chunk in response_stream:
-            if 'message' in chunk and 'content' in chunk['message']:
-                content = chunk['message']['content']
-                print(content, end='', flush=True)
-                fixed_files_text += content
+        
+        # Initialize the streaming context
+        with client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=True
+        ) as stream:
+            print("\n--- OpenAI GPT-4 Model Response ---\n")
+            for event in stream:
+                
+                # if 'choices' in event and len(event['choices']) > 0:
+                content = event.choices[0].delta.content
+                # content = delta.get('content', '')
+                if content:
+                    print(content, end='', flush=True)
+                    fixed_files_text += content
+                # else:
+                #     print("failed to get response from OpenAI")
+                #     print(event['choices'])
 
         print("\n")  # Ensure newline after streaming
         if not fixed_files_text.strip():
-            print("Received empty response from Ollama.")
+            print("Received empty response from OpenAI.")
             sys.exit(1)
         # Parse the fixed files from the response
         fixed_files = parse_fixed_files(fixed_files_text)
         return fixed_files
     except Exception as e:
-        print(f"Error communicating with Ollama: {e}")
+        print(f"Error communicating with OpenAI: {e}")
         sys.exit(1)
 
 def parse_fixed_files(fixed_files_text):
@@ -223,12 +213,14 @@ def initialize_output_folder(input_folder, output_folder):
 def main():
     args = parse_arguments()
 
+    # Initialize OpenAI API client
+    client = initialize_openai(args.openai_api_key)
+
     tf_bin = args.tf_bin
     input_folder = args.input
     output_folder = args.output_folder
     original_template_path = args.original_template
-    ollama_host = args.ollama_host
-    ollama_model = args.ollama_model
+    openai_model = args.openai_model
     max_retries = args.max_retries
     sleep_interval = args.sleep_interval
 
@@ -254,9 +246,39 @@ def main():
             print("Tofu plan successful. No changes needed.")
             break
         else:
-            print("Tofu plan failed. Attempting to fix files using Ollama model.")
+            print("Tofu plan failed. Attempting to fix files using OpenAI GPT-4 model.")
             files_content = read_all_files(output_folder)
-            fixed_files = send_to_ollama(ollama_host, ollama_model, tofu_output, files_content, original_template)
+            # Construct the prompt
+            prompt = f"""The following is the output from the tofu tool:
+
+{tofu_output}
+
+Here are the contents of the files:
+
+"""
+            # Include all files from the output folder
+            for filename, content in files_content.items():
+                prompt += f"[START FILE: {filename}]\n{content}\n[END FILE]\n\n"
+
+            # Include the original CloudFormation template
+            original_filename, original_content = original_template
+            prompt += f"[START FILE: {original_filename}]\n{original_content}\n[END FILE]\n\n"
+
+            prompt += """Please fix the files based on the tofu output. Ensure that the Terraform configuration aligns with the provided CloudFormation template. Provide only the fixed file contents with no additional commentary, maintaining the same filenames and the same [START FILE] and [END FILE] markers for each file."""
+
+            # Prepare the messages for the OpenAI chat
+            messages = [
+                {
+                    'role': 'system',
+                    'content': 'I am an expert at fixing Terraform files after a migration from CloudFormation. Please provide the output from the Terraform tool and the contents of the files that need to be fixed along with their original CloudFormation templates. I am extremely experienced with AWS.'
+                },
+                {
+                    'role': 'user',
+                    'content': prompt
+                }
+            ]
+
+            fixed_files = send_to_openai(client, openai_model, messages)
             write_fixed_files(output_folder, fixed_files)
 
             print("Re-running tofu with the fixed files.")
