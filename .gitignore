@@ -1,5 +1,5 @@
 # Example place for some output
-tmp-output
+tmp-output/*
 
 # Local .terraform directories
 **/.terraform/*

@@ -14,6 +14,7 @@ def parse_arguments():
     parser.add_argument('--tf-bin', required=True, help='Path to the tofu binary.')
     parser.add_argument('--input', required=True, help='Input folder for tofu.')
     parser.add_argument('--output-folder', required=True, help='Output folder for fixed files.')
+    parser.add_argument('--original-template', required=True, help='Path to the original CloudFormation template.')
     parser.add_argument('--ollama-host', default='http://localhost:11434', help='Ollama host URL (e.g., http://localhost:11434).')
     parser.add_argument('--ollama-model', default='llama3.1:8b', help='Ollama model name. Default is "llama3.1:8b".')
     parser.add_argument('--max-retries', type=int, default=5, help='Maximum number of retries for fixing.')
@@ -63,10 +64,14 @@ def run_tofu(tf_bin, working_folder):
 
 def read_all_files(folder):
     """
-    Reads all files in the specified folder and returns a dictionary of filename: content
+    Reads all files in the specified folder and returns a dictionary of filename: content.
+    Ignores the '.terraform' directory and its contents.
     """
     files_content = {}
     for root, dirs, files in os.walk(folder):
+        # Ignore the '.terraform' directory
+        if '.terraform' in dirs:
+            dirs.remove('.terraform')
         for filename in files:
             filepath = os.path.join(root, filename)
             relative_path = os.path.relpath(filepath, folder)
@@ -78,10 +83,28 @@ def read_all_files(folder):
                 sys.exit(1)
     return files_content
 
-def send_to_ollama(host, model, tofu_output, files_content):
+def read_original_template(template_path):
     """
-    Sends the tofu output and files content to the Ollama model and returns the fixed files content as a dictionary
+    Reads the original CloudFormation template file.
+    Returns the filename and its content.
+    """
+    if not os.path.isfile(template_path):
+        print(f"Original CloudFormation template not found at {template_path}")
+        sys.exit(1)
+    try:
+        with open(template_path, 'r', encoding='utf-8') as file:
+            content = file.read()
+        filename = os.path.basename(template_path)
+        return filename, content
+    except Exception as e:
+        print(f"Error reading original CloudFormation template: {e}")
+        sys.exit(1)
+
+def send_to_ollama(host, model, tofu_output, files_content, original_template):
+    """
+    Sends the tofu output, files content, and original template to the Ollama model.
     Streams the response in real-time.
+    Returns the fixed files content as a dictionary.
     """
     # Initialize the Ollama client
     client = Client(host=host)
@@ -94,13 +117,23 @@ def send_to_ollama(host, model, tofu_output, files_content):
 Here are the contents of the files:
 
 """
+
+    # Include all files from the output folder
     for filename, content in files_content.items():
         prompt += f"[START FILE: {filename}]\n{content}\n[END FILE]\n\n"
 
-    prompt += """Please fix the files based on the tofu output. Provide only the fixed file contents with no additional commentary, maintaining the same filenames and the same [START FILE] and [END FILE] markers for each file."""
+    # Include the original CloudFormation template
+    original_filename, original_content = original_template
+    prompt += f"[START FILE: {original_filename}]\n{original_content}\n[END FILE]\n\n"
+
+    prompt += """Please fix the files based on the tofu output. Ensure that the Terraform configuration aligns with the provided CloudFormation template. Provide only the fixed file contents with no additional commentary, maintaining the same filenames and the same [START FILE] and [END FILE] markers for each file."""
 
     # Prepare the messages for the Ollama chat
     messages = [
+        {
+            'role': 'system',
+            'content': 'I am an expert at fixing Terraform files after a migration from cloudformation. Please provide the output from the terraform tool and the contents of the files that need to be fixed and their original cloudformation. I am extremely experienced with AWS.'
+        },
         {
             'role': 'user',
             'content': prompt
@@ -133,7 +166,7 @@ Here are the contents of the files:
 
 def parse_fixed_files(fixed_files_text):
     """
-    Parses the fixed files text returned from the model and returns a dictionary of filename: content
+    Parses the fixed files text returned from the model and returns a dictionary of filename: content.
     """
     fixed_files = {}
     lines = fixed_files_text.splitlines()
@@ -193,6 +226,7 @@ def main():
     tf_bin = args.tf_bin
     input_folder = args.input
     output_folder = args.output_folder
+    original_template_path = args.original_template
     ollama_host = args.ollama_host
     ollama_model = args.ollama_model
     max_retries = args.max_retries
@@ -208,6 +242,8 @@ def main():
         sys.exit(1)
     # Initialize output folder
     initialize_output_folder(input_folder, output_folder)
+    # Read original CloudFormation template
+    original_template = read_original_template(original_template_path)
 
     attempt = 0
     while attempt < max_retries:
@@ -220,7 +256,7 @@ def main():
         else:
             print("Tofu plan failed. Attempting to fix files using Ollama model.")
             files_content = read_all_files(output_folder)
-            fixed_files = send_to_ollama(ollama_host, ollama_model, tofu_output, files_content)
+            fixed_files = send_to_ollama(ollama_host, ollama_model, tofu_output, files_content, original_template)
             write_fixed_files(output_folder, fixed_files)
 
             print("Re-running tofu with the fixed files.")
